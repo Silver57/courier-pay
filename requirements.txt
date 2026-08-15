@@ -1,0 +1,5 @@
+streamlit>=1.61,<2
+polars>=1.43,<2
+fastexcel>=0.20.2,<0.21
+pytest>=8
+xlsxwriter>=3
