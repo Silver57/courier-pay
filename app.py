@@ -6,6 +6,9 @@ ready-to-send text reports. Nothing is stored: state lives in the session only.
 
 from __future__ import annotations
 
+from datetime import date
+from typing import Any, Mapping
+
 import polars as pl
 import streamlit as st
 
@@ -16,6 +19,9 @@ from processing import (
     CAT_PUDO_NEXT,
     CAT_TO_DOOR,
     COURIER_TYPES,
+    AlgarveDay,
+    AlgarveRates,
+    DayRates,
     EpodError,
     PreparedData,
     RateKey,
@@ -30,10 +36,48 @@ CATEGORY_LABELS: dict[str, str] = {
     CAT_PUDO_FIRST: "PUDO first",
     CAT_PUDO_NEXT: "PUDO next",
 }
-DEFAULT_RATES: dict[RateKey, float] = {
-    (ctype, cat): 0.0 for ctype in COURIER_TYPES for cat in CATEGORY_LABELS
-}
 FT_STATE_KEY = "ft_couriers"
+
+MODE_STANDARD = "Standard"
+MODE_ALGARVE = "Algarve"
+ALGARVE_LIMIT_KEY = "algarve_daily_limit"
+ALGARVE_UP_KEY = "rate_algarve_up_to_limit"
+ALGARVE_ABOVE_KEY = "rate_algarve_above_limit"
+
+
+def rate_key(ctype: str, cat: str) -> str:
+    return f"rate_{ctype.lower()}_{cat.lower()}"
+
+
+# Initial values for every input in either pay mode, keyed by widget key.
+WIDGET_DEFAULTS: dict[str, float | int] = {
+    **{
+        rate_key(ctype, cat): 0.0
+        for ctype in COURIER_TYPES
+        for cat in CATEGORY_LABELS
+    },
+    ALGARVE_LIMIT_KEY: processing.ALGARVE_DAILY_LIMIT_DEFAULT,
+    ALGARVE_UP_KEY: 0.0,
+    ALGARVE_ABOVE_KEY: 0.0,
+}
+
+# Daily adjustments are remembered per mode for the session as
+# {date: {column label: value}}, so they survive mode switches and re-uploads.
+DAY_STORE_STANDARD = "day_adjust_standard"
+DAY_STORE_ALGARVE = "day_adjust_algarve"
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+PRICE_COLUMN = st.column_config.NumberColumn(
+    min_value=0.0, step=0.01, format="%.2f", help="Blank = sidebar price"
+)
+# Standard: one column per rate, labelled like "FT PUDO first".
+STANDARD_DAY_COLUMNS: dict[str, RateKey] = {
+    f"{ctype} {label}": (ctype, cat)
+    for ctype in COURIER_TYPES
+    for cat, label in CATEGORY_LABELS.items()
+}
+ALGARVE_DAY_LIMIT = "Daily limit"
+ALGARVE_DAY_UP = "Up to limit"
+ALGARVE_DAY_ABOVE = "Above limit"
 
 
 @st.cache_data(show_spinner="Parsing Excel file…")
@@ -41,6 +85,20 @@ def cached_prepare(file_bytes: bytes) -> PreparedData:
     """Parse + clean + classify. Cached on file content, so changing rates
     never re-parses the workbook."""
     return processing.prepare_from_bytes(file_bytes)
+
+
+def keep_widget_state() -> None:
+    """Seed input defaults and keep the values of inputs the other mode hides.
+
+    Streamlit discards the state of widgets that are not rendered in a run;
+    re-assigning them here means switching to Algarve and back keeps the
+    standard rates and the FT roster. Widgets therefore take no value= (it
+    would clash with state set through the Session State API).
+    """
+    for key, default in WIDGET_DEFAULTS.items():
+        st.session_state[key] = st.session_state.get(key, default)
+    if FT_STATE_KEY in st.session_state:
+        st.session_state[FT_STATE_KEY] = st.session_state[FT_STATE_KEY]
 
 
 def rates_sidebar() -> dict[RateKey, float]:
@@ -53,12 +111,39 @@ def rates_sidebar() -> dict[RateKey, float]:
             rates[(ctype, cat)] = st.sidebar.number_input(
                 label,
                 min_value=0.0,
-                value=DEFAULT_RATES[(ctype, cat)],
                 step=0.01,
                 format="%.2f",
-                key=f"rate_{ctype.lower()}_{cat.lower()}",
+                key=rate_key(ctype, cat),
             )
     return rates
+
+
+def algarve_sidebar() -> AlgarveRates:
+    """Daily limit plus the two tier rates, in EUR. Same for FT and OUT."""
+    st.sidebar.header("Algarve rates (EUR)")
+    limit = int(
+        st.sidebar.number_input(
+            "Daily limit (deliveries per courier per day)",
+            min_value=1,
+            step=1,
+            key=ALGARVE_LIMIT_KEY,
+        )
+    )
+    up_to = st.sidebar.number_input(
+        f"Up to {limit}/day",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        key=ALGARVE_UP_KEY,
+    )
+    above = st.sidebar.number_input(
+        f"Above {limit}/day",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        key=ALGARVE_ABOVE_KEY,
+    )
+    return AlgarveRates(up_to_limit=up_to, above_limit=above, daily_limit=limit)
 
 
 def resolve_full_time_couriers(
@@ -105,22 +190,26 @@ def show_courier_type_editor(names: list[str], detected_ft: list[str]) -> None:
         st.caption(f"{len(manual)} courier(s) changed from the automatic detection.")
 
 
-def show_summary(prep: PreparedData, payable: pl.DataFrame) -> None:
+def show_summary(prep: PreparedData, payable: pl.DataFrame, *, algarve: bool) -> None:
     stats = prep.stats
     period = processing.date_range(payable)
-    counts = processing.courier_counts_by_type(
-        payable.select("courier_norm", "courier_type").unique()
-    )
 
-    cols = st.columns(5)
+    cols = st.columns(4 if algarve else 5)
     cols[0].metric("Rows in file", f"{stats.total_rows:,}")
     cols[1].metric("Payable rows", f"{stats.payable_rows:,}")
     cols[2].metric(
         "Date range",
         f"{period[0]} → {period[1]}" if period else "—",
     )
-    cols[3].metric("Couriers (FT)", counts[TYPE_FT])
-    cols[4].metric("Couriers (OUT)", counts[TYPE_OUT])
+    if algarve:
+        # FT/OUT does not affect Algarve pay, so only the head count matters.
+        cols[3].metric("Couriers", payable["courier_norm"].n_unique())
+    else:
+        counts = processing.courier_counts_by_type(
+            payable.select("courier_norm", "courier_type").unique()
+        )
+        cols[3].metric("Couriers (FT)", counts[TYPE_FT])
+        cols[4].metric("Couriers (OUT)", counts[TYPE_OUT])
 
     if stats.pudo_rows_without_address:
         st.warning(
@@ -178,23 +267,129 @@ def show_summary(prep: PreparedData, payable: pl.DataFrame) -> None:
             )
 
 
-def show_results(result: processing.PayResult) -> None:
-    st.subheader("Results")
-    table = reports.summary_table(result.per_courier)
-    grand = pl.DataFrame(
+def day_table_editor(
+    payable: pl.DataFrame,
+    store_key: str,
+    columns: Mapping[str, tuple[pl.DataType, Any]],
+) -> dict[date, dict[str, Any]]:
+    """Calendar table: one row per day of the file's date range, with an
+    editable (dtype, column_config) column per adjustable value.
+
+    Returns {date: {label: value}} for days with at least one value entered.
+    The editor key carries the date range, so edits typed against one file
+    never shift onto the rows of another file with the same number of days.
+    """
+    period = processing.date_range(payable)
+    assert period is not None  # callers only get here with payable rows
+    days: list[date] = pl.date_range(*period, eager=True).to_list()
+    counts = dict(payable.group_by("task_date").len().iter_rows())
+    store: dict[date, dict[str, Any]] = st.session_state.setdefault(store_key, {})
+
+    base = pl.DataFrame(
         [
-            {
-                "Courier": "TOTAL",
-                "Type": "",
-                "TO_DOOR": int(result.per_courier["n_to_door"].sum() or 0),
-                "PUDO first": int(result.per_courier["n_pudo_first"].sum() or 0),
-                "PUDO next": int(result.per_courier["n_pudo_next"].sum() or 0),
-                "Deliveries": int(result.per_courier["n_total"].sum() or 0),
-                "Total (EUR)": reports.format_eur(result.grand_total_cents),
-            }
-        ],
-        schema=table.schema,
+            pl.Series("Date", days, dtype=pl.Date),
+            pl.Series("Day", [WEEKDAYS[d.weekday()] for d in days]),
+            pl.Series("Deliveries", [counts.get(d, 0) for d in days], dtype=pl.Int64),
+            *(
+                pl.Series(label, [store.get(d, {}).get(label) for d in days], dtype=dtype)
+                for label, (dtype, _) in columns.items()
+            ),
+        ]
     )
+    edited = st.data_editor(
+        base,
+        key=f"{store_key}_{period[0]}_{period[1]}",
+        num_rows="fixed",
+        hide_index=True,
+        disabled=["Date", "Day", "Deliveries"],
+        column_config={label: config for label, (_, config) in columns.items()},
+        # Tall enough to show a whole month without scrolling.
+        height=35 * (min(len(days), 31) + 1) + 3,
+    )
+
+    # Rows stay in order (fixed row count), so pair them with `days` rather
+    # than reading "Date" back: the editor returns it as a datetime.
+    adjusted: dict[date, dict[str, Any]] = {}
+    for day, row in zip(days, edited.iter_rows(named=True)):
+        values = {
+            label: row[label]
+            for label in columns
+            if row[label] is not None and row[label] == row[label]  # skip NaN
+        }
+        if values:
+            adjusted[day] = values
+    for day in days:
+        store.pop(day, None)
+    store.update(adjusted)
+
+    if adjusted:
+        listed = ", ".join(f"{d} ({WEEKDAYS[d.weekday()]})" for d in sorted(adjusted))
+        st.caption(f"{len(adjusted)} day(s) adjusted: {listed}")
+    else:
+        st.caption("No days adjusted — every day uses the sidebar prices.")
+    return adjusted
+
+
+def show_day_adjustments_intro() -> None:
+    st.subheader("Daily price adjustments")
+    st.caption(
+        "Every day is paid at the sidebar prices. Enter prices only on days that "
+        "differ; blank cells keep the sidebar price. Sundays are already paid "
+        "(\"já pagas\") unless you enter a value on that Sunday — the whole "
+        "Sunday is then paid here, with any blank cells at the sidebar price."
+    )
+
+
+def standard_day_rates(payable: pl.DataFrame) -> DayRates:
+    show_day_adjustments_intro()
+    columns = {label: (pl.Float64, PRICE_COLUMN) for label in STANDARD_DAY_COLUMNS}
+    adjusted = day_table_editor(payable, DAY_STORE_STANDARD, columns)
+    return {
+        day: {STANDARD_DAY_COLUMNS[label]: value for label, value in values.items()}
+        for day, values in adjusted.items()
+    }
+
+
+def algarve_day_rates(payable: pl.DataFrame) -> dict[date, AlgarveDay]:
+    show_day_adjustments_intro()
+    columns = {
+        ALGARVE_DAY_LIMIT: (
+            pl.Int64,
+            st.column_config.NumberColumn(
+                min_value=1, step=1, format="%d", help="Blank = sidebar limit"
+            ),
+        ),
+        ALGARVE_DAY_UP: (pl.Float64, PRICE_COLUMN),
+        ALGARVE_DAY_ABOVE: (pl.Float64, PRICE_COLUMN),
+    }
+    adjusted = day_table_editor(payable, DAY_STORE_ALGARVE, columns)
+    return {
+        day: AlgarveDay(
+            up_to_limit=values.get(ALGARVE_DAY_UP),
+            above_limit=values.get(ALGARVE_DAY_ABOVE),
+            daily_limit=(
+                int(values[ALGARVE_DAY_LIMIT]) if ALGARVE_DAY_LIMIT in values else None
+            ),
+        )
+        for day, values in adjusted.items()
+    }
+
+
+def show_results(result: processing.PayResult, table: pl.DataFrame) -> None:
+    """Results table (either mode) with a TOTAL row: counts summed, other
+    text columns blank, and the reconciled grand total."""
+    st.subheader("Results")
+    st.caption("Sunday deliveries are already paid: they are counted but add nothing to the totals.")
+    totals: dict[str, str | int] = {}
+    for name, dtype in table.schema.items():
+        if name == "Total (EUR)":
+            totals[name] = reports.format_eur(result.grand_total_cents)
+        elif dtype.is_integer():
+            totals[name] = int(table[name].sum() or 0)
+        else:
+            totals[name] = ""
+    totals[table.columns[0]] = "TOTAL"
+    grand = pl.DataFrame([totals], schema=table.schema)
     st.dataframe(pl.concat([table, grand]), hide_index=True, width="stretch")
 
     left, right = st.columns(2)
@@ -212,7 +407,13 @@ def main() -> None:
         "Nothing is saved — everything lives in this session only."
     )
 
-    rates = rates_sidebar()
+    keep_widget_state()
+    mode = st.sidebar.radio(
+        "Pay mode", (MODE_STANDARD, MODE_ALGARVE), horizontal=True, key="pay_mode"
+    )
+    rates = algarve_sidebar() if mode == MODE_ALGARVE else rates_sidebar()
+    algarve = isinstance(rates, AlgarveRates)
+
     uploaded = st.file_uploader(
         "EPOD task list export (.xlsx)", type="xlsx", key="epod_file"
     )
@@ -230,21 +431,31 @@ def main() -> None:
         return
 
     if prep.payable.height == 0:
-        show_summary(prep, prep.payable)
+        show_summary(prep, prep.payable, algarve=algarve)
         st.warning("No payable deliveries found in this file.")
         return
 
-    ft_names, all_names, detected_ft = resolve_full_time_couriers(prep)
-    payable = processing.apply_courier_type_overrides(prep.payable, ft_names)
+    if isinstance(rates, AlgarveRates):
+        show_summary(prep, prep.payable, algarve=True)
+        day_rates = algarve_day_rates(prep.payable)
+        result = processing.calculate_pay_algarve(prep.payable, rates, day_rates)
+        table = reports.summary_table_algarve(result.per_courier, rates.daily_limit)
+        all_reports = reports.build_all_reports_algarve(result)
+    else:
+        ft_names, all_names, detected_ft = resolve_full_time_couriers(prep)
+        payable = processing.apply_courier_type_overrides(prep.payable, ft_names)
 
-    show_summary(prep, payable)
-    show_courier_type_editor(all_names, detected_ft)
+        show_summary(prep, payable, algarve=False)
+        show_courier_type_editor(all_names, detected_ft)
+        day_rates = standard_day_rates(payable)
 
-    result = processing.calculate_pay(payable, rates)
-    show_results(result)
+        result = processing.calculate_pay(payable, rates, day_rates)
+        table = reports.summary_table(result.per_courier)
+        all_reports = reports.build_all_reports(result)
+
+    show_results(result, table)
 
     st.subheader("Courier reports")
-    all_reports = reports.build_all_reports(result, rates)
     names = list(all_reports)
     selected = st.selectbox("Preview report for", names, key="report_courier")
     if selected:
@@ -260,7 +471,7 @@ def main() -> None:
     )
     right.download_button(
         "Download summary (.csv)",
-        data=reports.summary_csv(result.per_courier),
+        data=reports.summary_csv(table),
         file_name="courier_pay_summary.csv",
         mime="text/csv",
         key="dl_csv",
