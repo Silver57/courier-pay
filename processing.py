@@ -52,9 +52,12 @@ DELIVERY_PUDO = "PUDO"
 VALID_DELIVERY_TYPES = (DELIVERY_TO_DOOR, DELIVERY_PUDO)
 
 CAT_TO_DOOR = "TO_DOOR"
+# Repeat package: the 2nd, 3rd, ... TO_DOOR delivery by the same courier, on the
+# same day, to the same address. The first one is a normal TO_DOOR.
+CAT_REPEAT = "REPEAT"
 CAT_PUDO_FIRST = "PUDO_FIRST"
 CAT_PUDO_NEXT = "PUDO_NEXT"
-CATEGORIES: tuple[str, ...] = (CAT_TO_DOOR, CAT_PUDO_FIRST, CAT_PUDO_NEXT)
+CATEGORIES: tuple[str, ...] = (CAT_TO_DOOR, CAT_REPEAT, CAT_PUDO_FIRST, CAT_PUDO_NEXT)
 
 TYPE_FT = "FT"
 TYPE_OUT = "OUT"
@@ -266,6 +269,7 @@ class CleaningStats:
     bad_delivery_type_excluded: int
     delivery_type_breakdown: dict[str, int]
     pudo_rows_without_address: int
+    to_door_rows_without_address: int
     payable_rows: int
 
     @property
@@ -326,26 +330,36 @@ def prepare(
         "exclusion_reason"
     )
 
-    # Category: one PUDO delivery per (courier, date, PUDO point) group is
-    # PUDO_FIRST, the rest PUDO_NEXT. No ordering exists — first row order
-    # wins. Including is_pudo in the struct keeps a TO_DOOR row whose fallback
-    # address coincides with a PUDO point from stealing first-distinct.
-    is_pudo = (pl.col(COL_DELIVERY_TYPE) == DELIVERY_PUDO).alias("is_pudo")
-    payable = payable.with_columns(is_pudo, sunday_expr())
-    first_of_group = pl.struct(
-        "courier_norm", "task_date", "pudo_point", "is_pudo"
-    ).is_first_distinct()
+    # Grouping address: the PUDO point for PUDO rows, the delivery address
+    # for TO_DOOR rows. Category: within each (courier, date, address,
+    # is_pudo) group exactly one delivery is the first — PUDO_FIRST or
+    # TO_DOOR — and the rest are PUDO_NEXT or REPEAT. No ordering exists, so
+    # first row order wins. Including is_pudo in the struct keeps a TO_DOOR
+    # row whose address coincides with a PUDO point from stealing
+    # first-distinct. A TO_DOOR row with no address cannot be matched to
+    # anything, so it is never a repeat (PUDO rows without a point keep
+    # grouping together, surfaced as a warning).
+    is_pudo = pl.col(COL_DELIVERY_TYPE) == DELIVERY_PUDO
     payable = payable.with_columns(
-        pl.when(~pl.col("is_pudo"))
-        .then(pl.lit(CAT_TO_DOOR))
-        .when(first_of_group)
-        .then(pl.lit(CAT_PUDO_FIRST))
-        .otherwise(pl.lit(CAT_PUDO_NEXT))
-        .alias("category"),
-        pl.when(pl.col("is_pudo"))
+        is_pudo.alias("is_pudo"),
+        pl.when(is_pudo)
         .then(pl.col("pudo_point"))
         .otherwise(pl.col(COL_ADDRESS))
         .alias("address_used"),
+        sunday_expr(),
+    )
+    first_of_group = pl.struct(
+        "courier_norm", "task_date", "address_used", "is_pudo"
+    ).is_first_distinct()
+    payable = payable.with_columns(
+        pl.when(pl.col("is_pudo") & first_of_group)
+        .then(pl.lit(CAT_PUDO_FIRST))
+        .when(pl.col("is_pudo"))
+        .then(pl.lit(CAT_PUDO_NEXT))
+        .when(first_of_group | pl.col("address_used").is_null())
+        .then(pl.lit(CAT_TO_DOOR))
+        .otherwise(pl.lit(CAT_REPEAT))
+        .alias("category")
     )
 
     reason_counts: dict[str, int] = dict(
@@ -373,6 +387,9 @@ def prepare(
         # normal and falls back to the delivery address.
         pudo_rows_without_address=payable.filter(
             pl.col("is_pudo") & pl.col("pudo_point").is_null()
+        ).height,
+        to_door_rows_without_address=payable.filter(
+            ~pl.col("is_pudo") & pl.col("address_used").is_null()
         ).height,
         payable_rows=payable.height,
     )
@@ -428,7 +445,8 @@ def apply_courier_type_overrides(
 
 
 def rates_frame(rates: Mapping[RateKey, float]) -> pl.DataFrame:
-    """6-row (courier_type, category, rate_cents) frame for the pay join."""
+    """(courier_type, category, rate_cents) frame for the pay join, one row
+    per rate (courier type x category)."""
     rows = [
         {
             "courier_type": ctype,
@@ -488,8 +506,8 @@ def calculate_pay(
     """Adjusted days use their own prices; every other day the normal rates.
 
     Category counts cover paid deliveries only (already-paid Sundays sit
-    outside them), so n_to_door + n_pudo_first + n_pudo_next + n_sundays ==
-    n_total.
+    outside them), so n_to_door + n_repeat + n_pudo_first + n_pudo_next +
+    n_sundays == n_total.
     """
     detail = (
         payable.join(
@@ -519,6 +537,7 @@ def calculate_pay(
         detail.group_by("courier_norm", "courier_type")
         .agg(
             ((pl.col("category") == CAT_TO_DOOR) & paid).sum().cast(pl.Int64).alias("n_to_door"),
+            ((pl.col("category") == CAT_REPEAT) & paid).sum().cast(pl.Int64).alias("n_repeat"),
             ((pl.col("category") == CAT_PUDO_FIRST) & paid).sum().cast(pl.Int64).alias("n_pudo_first"),
             ((pl.col("category") == CAT_PUDO_NEXT) & paid).sum().cast(pl.Int64).alias("n_pudo_next"),
             pl.col("already_paid").sum().cast(pl.Int64).alias("n_sundays"),
@@ -535,6 +554,9 @@ class AlgarveRates:
     up_to_limit: float  # EUR per delivery, first daily_limit of the day
     above_limit: float  # EUR per delivery beyond daily_limit
     daily_limit: int = ALGARVE_DAILY_LIMIT_DEFAULT
+    # EUR per REPEAT package (2nd+ TO_DOOR at the same address that day).
+    # Repeats are paid this flat rate and do not count toward the limit.
+    repeat: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -544,13 +566,15 @@ class AlgarveDay:
     up_to_limit: float | None = None
     above_limit: float | None = None
     daily_limit: int | None = None
+    repeat: float | None = None
 
 
 def algarve_days_frame(
     rates: AlgarveRates, day_rates: Mapping[date, AlgarveDay]
 ) -> pl.DataFrame:
-    """(task_date, day_limit, day_up_cents, day_above_cents) for adjusted
-    days, with values a day leaves out filled from the normal rates."""
+    """(task_date, day_limit, day_up_cents, day_above_cents, day_repeat_cents)
+    for adjusted days, with values a day leaves out filled from the normal
+    rates."""
     rows = [
         {
             "task_date": day,
@@ -560,6 +584,9 @@ def algarve_days_frame(
             ),
             "day_above_cents": round(
                 (rates.above_limit if adj.above_limit is None else adj.above_limit) * 100
+            ),
+            "day_repeat_cents": round(
+                (rates.repeat if adj.repeat is None else adj.repeat) * 100
             ),
         }
         for day, adj in day_rates.items()
@@ -571,6 +598,7 @@ def algarve_days_frame(
             "day_limit": pl.Int64,
             "day_up_cents": pl.Int64,
             "day_above_cents": pl.Int64,
+            "day_repeat_cents": pl.Int64,
         },
     )
 
@@ -582,15 +610,20 @@ def calculate_pay_algarve(
 ) -> PayResult:
     """Marginal daily tiers: the count resets per (courier, task date).
 
-    Every payable delivery counts regardless of category or courier type. No
-    ordering exists, so row order decides which rows land above the limit —
-    totals are unaffected since all rows in a tier share one rate. Adjusted
-    days use their own limit and prices.
+    Every payable delivery counts regardless of PUDO/TO_DOOR or courier type,
+    except REPEAT packages (2nd+ TO_DOOR at the same address that day): those
+    are paid the flat repeat rate and take no place in the tiers. No ordering
+    exists, so row order decides which rows land above the limit — totals are
+    unaffected since all rows in a tier share one rate. Adjusted days use
+    their own limit and prices.
 
     Already-paid Sunday deliveries sit in neither tier (see already_paid_expr),
-    so n_up_to_limit + n_above_limit + n_sundays == n_total.
+    so n_up_to_limit + n_above_limit + n_repeat + n_sundays == n_total.
     """
-    position = pl.int_range(pl.len()).over("courier_norm", "task_date")
+    is_repeat = pl.col("category") == CAT_REPEAT
+    # 0-based position among the tiered (non-repeat) rows of the courier-day;
+    # meaningless for repeat rows, which never use it.
+    position = (~is_repeat).cast(pl.Int64).cum_sum().over("courier_norm", "task_date") - 1
     paid = ~pl.col("already_paid")
     detail = (
         payable.join(
@@ -602,26 +635,36 @@ def calculate_pay_algarve(
         .with_columns(pl.col("day_limit").is_not_null().alias("day_adjusted"))
         .with_columns(already_paid_expr())
         .with_columns(
-            (paid & (position >= pl.col("day_limit").fill_null(rates.daily_limit)))
-            .alias("above_limit")
+            (paid & is_repeat).alias("is_repeat"),
+            (
+                paid
+                & ~is_repeat
+                & (position >= pl.col("day_limit").fill_null(rates.daily_limit))
+            ).alias("above_limit"),
         )
         .with_columns(
             pl.when(pl.col("already_paid"))
             .then(pl.lit(0, dtype=pl.Int64))
+            .when(pl.col("is_repeat"))
+            .then(pl.col("day_repeat_cents").fill_null(round(rates.repeat * 100)))
             .when(pl.col("above_limit"))
             .then(pl.col("day_above_cents").fill_null(round(rates.above_limit * 100)))
             .otherwise(pl.col("day_up_cents").fill_null(round(rates.up_to_limit * 100)))
             .cast(pl.Int64)
             .alias("rate_cents")
         )
-        .drop("day_limit", "day_up_cents", "day_above_cents")
+        .drop("day_limit", "day_up_cents", "day_above_cents", "day_repeat_cents")
     )
     per_courier = (
         detail.group_by("courier_norm")
         .agg(
             pl.col("task_date").n_unique().cast(pl.Int64).alias("n_days"),
-            (paid & ~pl.col("above_limit")).sum().cast(pl.Int64).alias("n_up_to_limit"),
+            (paid & ~pl.col("above_limit") & ~pl.col("is_repeat"))
+            .sum()
+            .cast(pl.Int64)
+            .alias("n_up_to_limit"),
             pl.col("above_limit").sum().cast(pl.Int64).alias("n_above_limit"),
+            pl.col("is_repeat").sum().cast(pl.Int64).alias("n_repeat"),
             pl.col("already_paid").sum().cast(pl.Int64).alias("n_sundays"),
             pl.len().cast(pl.Int64).alias("n_total"),
             pl.col("rate_cents").sum().alias("total_cents"),

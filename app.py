@@ -17,6 +17,7 @@ import reports
 from processing import (
     CAT_PUDO_FIRST,
     CAT_PUDO_NEXT,
+    CAT_REPEAT,
     CAT_TO_DOOR,
     COURIER_TYPES,
     AlgarveDay,
@@ -33,9 +34,14 @@ st.set_page_config(page_title="courier-pay", page_icon="📦", layout="wide")
 
 CATEGORY_LABELS: dict[str, str] = {
     CAT_TO_DOOR: "TO_DOOR",
+    CAT_REPEAT: "Repeat",
     CAT_PUDO_FIRST: "PUDO first",
     CAT_PUDO_NEXT: "PUDO next",
 }
+REPEAT_HELP = (
+    "Repeat package: the 2nd, 3rd, … TO_DOOR delivery by the same courier, on "
+    "the same day, to the same address. The first one is paid as TO_DOOR."
+)
 FT_STATE_KEY = "ft_couriers"
 
 MODE_STANDARD = "Standard"
@@ -43,6 +49,7 @@ MODE_ALGARVE = "Algarve"
 ALGARVE_LIMIT_KEY = "algarve_daily_limit"
 ALGARVE_UP_KEY = "rate_algarve_up_to_limit"
 ALGARVE_ABOVE_KEY = "rate_algarve_above_limit"
+ALGARVE_REPEAT_KEY = "rate_algarve_repeat"
 
 
 def rate_key(ctype: str, cat: str) -> str:
@@ -59,6 +66,7 @@ WIDGET_DEFAULTS: dict[str, float | int] = {
     ALGARVE_LIMIT_KEY: processing.ALGARVE_DAILY_LIMIT_DEFAULT,
     ALGARVE_UP_KEY: 0.0,
     ALGARVE_ABOVE_KEY: 0.0,
+    ALGARVE_REPEAT_KEY: 0.0,
 }
 
 # Daily adjustments are remembered per mode for the session as
@@ -78,6 +86,7 @@ STANDARD_DAY_COLUMNS: dict[str, RateKey] = {
 ALGARVE_DAY_LIMIT = "Daily limit"
 ALGARVE_DAY_UP = "Up to limit"
 ALGARVE_DAY_ABOVE = "Above limit"
+ALGARVE_DAY_REPEAT = "Repeat"
 
 
 @st.cache_data(show_spinner="Parsing Excel file…")
@@ -102,7 +111,7 @@ def keep_widget_state() -> None:
 
 
 def rates_sidebar() -> dict[RateKey, float]:
-    """Six independent rate inputs (courier type x category), in EUR."""
+    """Eight independent rate inputs (courier type x category), in EUR."""
     st.sidebar.header("Rates (EUR)")
     rates: dict[RateKey, float] = {}
     for ctype, heading in ((TYPE_FT, "Full-time (FT)"), (TYPE_OUT, "Outsourced (OUT)")):
@@ -114,12 +123,14 @@ def rates_sidebar() -> dict[RateKey, float]:
                 step=0.01,
                 format="%.2f",
                 key=rate_key(ctype, cat),
+                help=REPEAT_HELP if cat == CAT_REPEAT else None,
             )
     return rates
 
 
 def algarve_sidebar() -> AlgarveRates:
-    """Daily limit plus the two tier rates, in EUR. Same for FT and OUT."""
+    """Daily limit, the two tier rates and the repeat-package rate, in EUR.
+    Same for FT and OUT."""
     st.sidebar.header("Algarve rates (EUR)")
     limit = int(
         st.sidebar.number_input(
@@ -143,7 +154,17 @@ def algarve_sidebar() -> AlgarveRates:
         format="%.2f",
         key=ALGARVE_ABOVE_KEY,
     )
-    return AlgarveRates(up_to_limit=up_to, above_limit=above, daily_limit=limit)
+    repeat = st.sidebar.number_input(
+        "Repeat package (outside the tiers)",
+        min_value=0.0,
+        step=0.01,
+        format="%.2f",
+        key=ALGARVE_REPEAT_KEY,
+        help=REPEAT_HELP + " Repeats are paid this flat rate and do not count toward the daily limit.",
+    )
+    return AlgarveRates(
+        up_to_limit=up_to, above_limit=above, daily_limit=limit, repeat=repeat
+    )
 
 
 def resolve_full_time_couriers(
@@ -215,6 +236,11 @@ def show_summary(prep: PreparedData, payable: pl.DataFrame, *, algarve: bool) ->
         st.warning(
             f"{stats.pudo_rows_without_address:,} PUDO rows have no address at all; "
             "they are grouped together per courier and day."
+        )
+    if stats.to_door_rows_without_address:
+        st.warning(
+            f"{stats.to_door_rows_without_address:,} TO_DOOR rows have no address; "
+            "they are always paid as TO_DOOR (never as a repeat package)."
         )
 
     with st.expander(f"Excluded rows ({stats.excluded_rows:,})"):
@@ -361,12 +387,14 @@ def algarve_day_rates(payable: pl.DataFrame) -> dict[date, AlgarveDay]:
         ),
         ALGARVE_DAY_UP: (pl.Float64, PRICE_COLUMN),
         ALGARVE_DAY_ABOVE: (pl.Float64, PRICE_COLUMN),
+        ALGARVE_DAY_REPEAT: (pl.Float64, PRICE_COLUMN),
     }
     adjusted = day_table_editor(payable, DAY_STORE_ALGARVE, columns)
     return {
         day: AlgarveDay(
             up_to_limit=values.get(ALGARVE_DAY_UP),
             above_limit=values.get(ALGARVE_DAY_ABOVE),
+            repeat=values.get(ALGARVE_DAY_REPEAT),
             daily_limit=(
                 int(values[ALGARVE_DAY_LIMIT]) if ALGARVE_DAY_LIMIT in values else None
             ),
@@ -379,7 +407,11 @@ def show_results(result: processing.PayResult, table: pl.DataFrame) -> None:
     """Results table (either mode) with a TOTAL row: counts summed, other
     text columns blank, and the reconciled grand total."""
     st.subheader("Results")
-    st.caption("Sunday deliveries are already paid: they are counted but add nothing to the totals.")
+    st.caption(
+        "Sunday deliveries are already paid: they are counted but add nothing to "
+        "the totals. Repeat = 2nd+ TO_DOOR package at the same address, same "
+        "courier and day."
+    )
     totals: dict[str, str | int] = {}
     for name, dtype in table.schema.items():
         if name == "Total (EUR)":

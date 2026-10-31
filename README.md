@@ -75,13 +75,19 @@ session — re-uploading a corrected export keeps the same couriers marked.
 
 **Categories** — every payable delivery is exactly one of:
 
-- `TO_DOOR`
+- `TO_DOOR` — within each group of (normalized courier, task date, exact
+  trimmed `Detailed address`) exactly one TO_DOOR delivery is the first.
+- `REPEAT` — the remaining TO_DOOR deliveries in that group: the 2nd, 3rd, …
+  package the same courier delivers to the same address on the same day
+  ("repeat packages"). The grouping ignores row order and time of day, exactly
+  like PUDO. A TO_DOOR row with no address is never a repeat; such rows are
+  counted and surfaced as a warning.
 - `PUDO_FIRST` — within each group of (normalized courier, task date, PUDO
   point) exactly one PUDO delivery is the first. There is no ordering
   information in the file, so "first" simply means one row per group.
 - `PUDO_NEXT` — the remaining PUDO deliveries in that group.
 
-**Rates** — six independent values (courier type × category) set in the
+**Rates** — eight independent values (courier type × category) set in the
 sidebar, in EUR with 2 decimals. Pay per delivery is the matching rate; a
 courier's total is the sum of their rows.
 
@@ -95,16 +101,17 @@ exact.
 ### Algarve mode
 
 The **Pay mode** switch at the top of the sidebar picks **Standard** (the rules
-above) or **Algarve** for the whole uploaded file. Algarve pay uses three
-sidebar inputs: a daily limit (default 70), the rate up to that limit, and the
-rate above it.
+above) or **Algarve** for the whole uploaded file. Algarve pay uses four
+sidebar inputs: a daily limit (default 70), the rate up to that limit, the
+rate above it, and a flat rate per repeat package.
 
 - The count restarts for **each courier on each task date**.
 - Tiers are marginal: a courier with 85 deliveries on one day is paid
   70 × the up-to rate + 15 × the above rate.
 - Every payable delivery counts toward the limit, whatever its type (TO_DOOR,
-  PUDO first and PUDO next alike). Rows excluded by the hygiene rules below
-  (non-Delivered, duplicates, …) do not count.
+  PUDO first and PUDO next alike), except `REPEAT` packages: those are paid
+  the flat repeat rate and take no place in the tiers. Rows excluded by the
+  hygiene rules below (non-Delivered, duplicates, …) do not count.
 - FT/OUT does not apply: every courier has the same two rates, and the courier
   types editor is hidden.
 
@@ -121,9 +128,10 @@ Normally every day is paid at the sidebar prices. Once a file is uploaded, the
 **Daily price adjustments** table lists every day from the file's first to last
 task date (with its delivery count), so specific days can be paid differently:
 
-- **Standard** — one column per rate (`FT TO_DOOR` … `OUT PUDO next`).
-- **Algarve** — `Daily limit`, `Up to limit` and `Above limit`, so a day can
-  have its own limit as well as its own prices.
+- **Standard** — one column per rate (`FT TO_DOOR`, `FT Repeat` … `OUT PUDO
+  next`).
+- **Algarve** — `Daily limit`, `Up to limit`, `Above limit` and `Repeat`, so a
+  day can have its own limit as well as its own prices.
 
 Enter values only on the days that differ. A blank cell on an adjusted day
 keeps the sidebar value, and an adjustment applies to every courier that day.
@@ -162,6 +170,7 @@ Courier: Ana Silva (OUT)
 Period: 2026-08-13 — 2026-08-14
 ------------------------------------------
 TO_DOOR:     2 x 0.50 = 1.00
+Repeat:      0 x 0.20 = 0.00
 PUDO first:  1 x 1.25 = 1.25
 PUDO next:   0 x 0.30 = 0.00
 TOTAL: 2.25 EUR
@@ -184,8 +193,8 @@ TOTAL: 192.00 EUR
 
 The period spans the courier's first and last delivery date. Downloads: all
 reports bundled as a `.zip` (one `.txt` per courier) and the results table as
-`.csv` (Algarve columns: Courier, Days, Up to N/day, Above N/day, Deliveries,
-Total).
+`.csv` (Algarve columns: Courier, Days, Up to N/day, Above N/day, Repeat,
+Sundays, Deliveries, Total).
 
 ## Layout
 

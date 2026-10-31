@@ -8,7 +8,13 @@ from datetime import date
 
 from conftest import make_rows
 
-from processing import AlgarveRates, PayResult, calculate_pay_algarve, prepare
+from processing import (
+    AlgarveDay,
+    AlgarveRates,
+    PayResult,
+    calculate_pay_algarve,
+    prepare,
+)
 from reports import (
     build_all_reports_algarve,
     reports_zip,
@@ -107,6 +113,33 @@ def test_categories_and_courier_type_do_not_matter() -> None:
     assert result.reconciled is True
 
 
+def test_repeat_packages_are_paid_flat_and_sit_outside_the_tiers() -> None:
+    rates = AlgarveRates(up_to_limit=1.00, above_limit=0.80, daily_limit=3, repeat=0.25)
+    result = pay(
+        *[{"Courier Name": "Ana Silva", "Detailed address": "Rua A 1"}] * 3,
+        {"Courier Name": "Ana Silva", "Detailed address": "Rua B 2"},
+        {"Courier Name": "Ana Silva", "Detailed address": "Rua C 3"},
+        rates=rates,
+    )
+    # Rua A: 1 TO_DOOR + 2 repeats. Tiered rows are Rua A (1st), Rua B, Rua C:
+    # exactly the limit, so nothing is above it. 3 x 1.00 + 2 x 0.25 = 3.50
+    assert split(result) == {"Ana Silva": (3, 0, 350)}
+    row = result.per_courier.row(0, named=True)
+    assert (row["n_repeat"], row["n_total"]) == (2, 5)
+    assert result.reconciled is True
+
+
+def test_repeat_rate_defaults_to_zero_and_can_be_adjusted_per_day() -> None:
+    rows = [{"Courier Name": "Ana Silva", "Detailed address": "Rua A 1"}] * 2
+    assert split(pay(*rows)) == {"Ana Silva": (1, 0, 100)}
+
+    payable = prepare(make_rows(*rows)).payable
+    adjusted = calculate_pay_algarve(
+        payable, RATES, {date(2026, 8, 13): AlgarveDay(repeat=0.30)}
+    )
+    assert split(adjusted) == {"Ana Silva": (1, 0, 130)}
+
+
 def test_only_payable_deliveries_count_toward_the_limit() -> None:
     result = pay(
         *[{"Courier Name": "Ana Silva"}] * 70,
@@ -190,9 +223,9 @@ def test_algarve_summary_csv_and_zip() -> None:
     table = summary_table_algarve(result.per_courier, RATES.daily_limit)
     lines = summary_csv(table).decode().strip().splitlines()
     assert lines == [
-        "Courier,Days,Up to 70/day,Above 70/day,Sundays,Deliveries,Total (EUR)",
-        "Ana Silva,1,70,15,0,85,82.00",
-        "Rui Costa,1,1,0,0,1,1.00",
+        "Courier,Days,Up to 70/day,Above 70/day,Repeat,Sundays,Deliveries,Total (EUR)",
+        "Ana Silva,1,70,15,0,0,85,82.00",
+        "Rui Costa,1,1,0,0,0,1,1.00",
     ]
 
     all_reports = build_all_reports_algarve(result)

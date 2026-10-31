@@ -34,6 +34,9 @@ def make_rows(*overrides: dict[str, Any]) -> pl.DataFrame:
     for i, override in enumerate(overrides):
         row = dict(ROW_DEFAULTS)
         row["Waybill Number"] = f"WB{i + 1}"
+        # Unique per row, so rows only share an address (and become repeat
+        # packages) when a test says so explicitly.
+        row["Detailed address"] = f"Rua A {i + 1}"
         row.update(override)
         rows.append(row)
     return pl.DataFrame(

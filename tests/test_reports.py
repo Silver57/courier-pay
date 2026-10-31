@@ -11,6 +11,7 @@ from conftest import make_rows
 from processing import (
     CAT_PUDO_FIRST,
     CAT_PUDO_NEXT,
+    CAT_REPEAT,
     CAT_TO_DOOR,
     TYPE_FT,
     TYPE_OUT,
@@ -31,9 +32,11 @@ from reports import (
 
 RATES = {
     (TYPE_FT, CAT_TO_DOOR): 1.10,
+    (TYPE_FT, CAT_REPEAT): 0.40,
     (TYPE_FT, CAT_PUDO_FIRST): 2.20,
     (TYPE_FT, CAT_PUDO_NEXT): 0.55,
     (TYPE_OUT, CAT_TO_DOOR): 0.50,
+    (TYPE_OUT, CAT_REPEAT): 0.20,
     (TYPE_OUT, CAT_PUDO_FIRST): 1.25,
     (TYPE_OUT, CAT_PUDO_NEXT): 0.30,
 }
@@ -139,7 +142,9 @@ def test_sunday_deliveries_are_counted_but_not_paid() -> None:
     result = calculate_pay(prepared.payable, RATES)
     row = result.per_courier.row(0, named=True)
 
-    assert (row["n_to_door"], row["n_pudo_first"], row["n_pudo_next"]) == (1, 0, 0)
+    assert (row["n_to_door"], row["n_repeat"], row["n_pudo_first"], row["n_pudo_next"]) == (
+        1, 0, 0, 0,
+    )
     assert (row["n_sundays"], row["n_total"], row["total_cents"]) == (2, 3, 50)
     assert result.grand_total_cents == 50
     assert result.reconciled is True
@@ -242,7 +247,30 @@ def test_summary_csv_has_header_and_one_row_per_courier() -> None:
     table = summary_table(result.per_courier)
     lines = summary_csv(table).decode().strip().splitlines()
     assert lines[0] == (
-        "Courier,Type,TO_DOOR,PUDO first,PUDO next,Sundays,Deliveries,Total (EUR)"
+        "Courier,Type,TO_DOOR,Repeat,PUDO first,PUDO next,Sundays,Deliveries,Total (EUR)"
     )
-    assert lines[1] == "Ana Silva,OUT,1,0,0,0,1,0.50"
+    assert lines[1] == "Ana Silva,OUT,1,0,0,0,0,1,0.50"
     assert len(lines) == 3
+
+
+def test_repeat_packages_are_paid_the_repeat_rate_of_the_courier_type() -> None:
+    prepared = prepare(
+        make_rows(
+            *[{"Courier Name": "OUT One", "Detailed address": "Rua A 1"}] * 3,
+            *[{"Courier Name": "FT Two", "Detailed address": "Rua A 1"}] * 2,
+        )
+    )
+    result = calculate_pay(prepared.payable, RATES)
+
+    # OUT One: 1 x 0.50 + 2 x 0.20 = 0.90 ; FT Two: 1 x 1.10 + 1 x 0.40 = 1.50
+    rows = {r["courier_norm"]: r for r in result.per_courier.iter_rows(named=True)}
+    assert (rows["OUT One"]["n_to_door"], rows["OUT One"]["n_repeat"]) == (1, 2)
+    assert (rows["OUT One"]["total_cents"], rows["FT Two"]["total_cents"]) == (90, 150)
+    assert result.reconciled is True
+
+    report = build_all_reports(result)["OUT One"]
+    assert (
+        "Restantes entregas: 3\n"
+        "- 1 pagas a 0.50€\n"
+        "- 2 pagas a 0.20€\n"
+    ) in report

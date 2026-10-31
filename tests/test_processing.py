@@ -7,6 +7,7 @@ from conftest import make_rows
 from processing import (
     CAT_PUDO_FIRST,
     CAT_PUDO_NEXT,
+    CAT_REPEAT,
     CAT_TO_DOOR,
     REASON_DUPLICATE,
     REASON_MISSING,
@@ -77,6 +78,66 @@ def test_depot_tag_stripping_is_available_as_a_toggle() -> None:
         make_rows({"Courier Name": "Ricardo LourinhoQTK-LIS"}), strip_depot_tag=True
     )
     assert prepared.payable["courier_norm"].to_list() == ["Ricardo Lourinho"]
+
+
+# --- Repeat packages (2nd+ TO_DOOR at the same address, courier and day) ----
+
+
+def test_extra_packages_at_the_same_address_are_repeats() -> None:
+    prepared = prepare(
+        make_rows(*[{"Detailed address": "Rua A 1"} for _ in range(3)])
+    )
+    assert categories(prepared) == [CAT_TO_DOOR, CAT_REPEAT, CAT_REPEAT]
+
+
+def test_repeat_needs_same_courier_day_and_exact_address() -> None:
+    prepared = prepare(
+        make_rows(
+            {"Detailed address": "Rua A 1"},
+            {"Detailed address": "Rua A 1", "Task Date": "2026-08-14"},
+            {"Detailed address": "Rua A 1", "Courier Name": "Other"},
+            {"Detailed address": "Rua A 1, 2 Esq"},
+            {"Detailed address": "rua a 1"},
+            {"Detailed address": "  Rua A 1  "},  # trimmed: same address
+        )
+    )
+    assert categories(prepared) == [CAT_TO_DOOR] * 5 + [CAT_REPEAT]
+
+
+def test_repeat_grouping_ignores_row_order_within_the_day() -> None:
+    prepared = prepare(
+        make_rows(
+            {"Detailed address": "Rua A 1"},
+            {"Detailed address": "Rua B 2"},
+            {"Detailed address": "Rua A 1"},
+        )
+    )
+    assert categories(prepared) == [CAT_TO_DOOR, CAT_TO_DOOR, CAT_REPEAT]
+
+
+def test_to_door_without_address_is_never_a_repeat() -> None:
+    prepared = prepare(
+        make_rows({"Detailed address": ""}, {"Detailed address": ""})
+    )
+    assert categories(prepared) == [CAT_TO_DOOR, CAT_TO_DOOR]
+    assert prepared.stats.to_door_rows_without_address == 2
+
+
+def test_pudo_rows_at_a_to_door_address_do_not_mix() -> None:
+    prepared = prepare(
+        make_rows(
+            {"Delivery Type": "TO_DOOR", "Detailed address": "Shared"},
+            {"Delivery Type": "PUDO", "PUDO address": "Shared"},
+            {"Delivery Type": "TO_DOOR", "Detailed address": "Shared"},
+            {"Delivery Type": "PUDO", "PUDO address": "Shared"},
+        )
+    )
+    assert categories(prepared) == [
+        CAT_TO_DOOR,
+        CAT_PUDO_FIRST,
+        CAT_REPEAT,
+        CAT_PUDO_NEXT,
+    ]
 
 
 # --- PUDO first / next ------------------------------------------------------
@@ -226,11 +287,11 @@ def test_dedupe_keeps_first_occurrence_and_counts_drops() -> None:
             {"Waybill Number": "DUP", "Detailed address": "kept"},
             {"Waybill Number": "DUP", "Detailed address": "dropped"},
             {"Waybill Number": "DUP", "Detailed address": "dropped too"},
-            {"Waybill Number": "UNIQUE"},
+            {"Waybill Number": "UNIQUE", "Detailed address": "unique"},
         )
     )
     assert prepared.stats.duplicates_removed == 2
-    assert prepared.payable["Detailed address"].to_list() == ["kept", "Rua A 1"]
+    assert prepared.payable["Detailed address"].to_list() == ["kept", "unique"]
     assert prepared.excluded["exclusion_reason"].to_list() == [REASON_DUPLICATE] * 2
 
 

@@ -238,6 +238,7 @@ def summary_table(per_courier: pl.DataFrame) -> pl.DataFrame:
         pl.col("courier_norm").alias("Courier"),
         pl.col("courier_type").alias("Type"),
         pl.col("n_to_door").alias("TO_DOOR"),
+        pl.col("n_repeat").alias("Repeat"),
         pl.col("n_pudo_first").alias("PUDO first"),
         pl.col("n_pudo_next").alias("PUDO next"),
         pl.col("n_sundays").alias("Sundays"),
@@ -255,6 +256,7 @@ def summary_table_algarve(per_courier: pl.DataFrame, daily_limit: int) -> pl.Dat
         pl.col("n_days").alias("Days"),
         pl.col("n_up_to_limit").alias(f"Up to {daily_limit}/day"),
         pl.col("n_above_limit").alias(f"Above {daily_limit}/day"),
+        pl.col("n_repeat").alias("Repeat"),
         pl.col("n_sundays").alias("Sundays"),
         pl.col("n_total").alias("Deliveries"),
         pl.col("total_cents")

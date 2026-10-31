@@ -9,6 +9,7 @@ from conftest import make_rows
 from processing import (
     CAT_PUDO_FIRST,
     CAT_PUDO_NEXT,
+    CAT_REPEAT,
     CAT_TO_DOOR,
     TYPE_FT,
     TYPE_OUT,
@@ -23,9 +24,11 @@ from reports import build_all_reports, build_all_reports_algarve
 
 RATES = {
     (TYPE_FT, CAT_TO_DOOR): 1.10,
+    (TYPE_FT, CAT_REPEAT): 0.40,
     (TYPE_FT, CAT_PUDO_FIRST): 2.20,
     (TYPE_FT, CAT_PUDO_NEXT): 0.55,
     (TYPE_OUT, CAT_TO_DOOR): 0.50,
+    (TYPE_OUT, CAT_REPEAT): 0.20,
     (TYPE_OUT, CAT_PUDO_FIRST): 1.25,
     (TYPE_OUT, CAT_PUDO_NEXT): 0.30,
 }
